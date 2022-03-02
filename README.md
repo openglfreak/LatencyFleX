@@ -21,7 +21,6 @@ To learn more about LatencyFleX's internals, check out [the blog post](https://i
 
 - Minor stutters might happen.
 - GPU utilization will be lower (around 95% when GPU bound).
-- It might take one second or two to adapt to large frame rate increases (e.g. if the game sets a background frame limit).
 
 ## Building from source
 
