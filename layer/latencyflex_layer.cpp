@@ -498,7 +498,7 @@ extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
     if (target > failsafe) {
       wakeup = failsafe;
       failsafe_triggered++;
-      if (failsafe_triggered > 5) {
+      if (failsafe_triggered > 0) {
         // If failsafe is triggered multiple times in a row, initiate a recalibration.
         ticker_needs_reset.store(true);
       }
