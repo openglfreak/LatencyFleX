@@ -90,7 +90,7 @@ public:
   uint64_t GetWaitTarget(uint64_t frame_id) {
     if (prev_frame_end_id_ != UINT64_MAX) {
       size_t phase = frame_id % kNumPhases;
-      double invtpt = inv_throughtput_.get();
+      double invtpt = std::max(inv_throughtput_.get(), (double)target_frame_time);
       int64_t comp_to_apply = 0;
       if (frame_end_projection_base_ == UINT64_MAX) {
         frame_end_projection_base_ = prev_frame_end_ts_;
@@ -103,7 +103,7 @@ public:
         // In the section below, we attempt to apply additional compensation in
         // the case of delay increase, to prevent extra queuing as much as possible.
         int64_t prediction_error =
-            (int64_t)prev_frame_end_ts_ -
+            (int64_t)prev_frame_real_end_ts_ -
             (int64_t)(frame_end_projection_base_ +
                       frame_end_projected_ts_[prev_frame_end_id_ % kMaxInflightFrames]);
         TRACE_COUNTER("latencyflex", "Prediction error", prediction_error);
@@ -216,8 +216,6 @@ public:
 
       if (frame_time && prev_frame_end_id_ != UINT64_MAX)
         *frame_time = timestamp - prev_frame_real_end_ts_;
-      prev_frame_real_end_ts_ = timestamp;
-      timestamp = std::max(timestamp, prev_frame_end_ts_ + target_frame_time);
       auto frame_start = frame_begin_ts_[frame_id % kMaxInflightFrames];
       latency_val = (int64_t)timestamp - (int64_t)frame_start;
       if (phase == kDown) {
@@ -231,8 +229,8 @@ public:
         if (frame_id > prev_frame_end_id_) {
           auto frames_elapsed = frame_id - prev_frame_end_id_;
           frame_time_val =
-              ((int64_t)timestamp - (int64_t)prev_frame_end_ts_) / (int64_t)frames_elapsed;
-          frame_time_val = std::clamp(frame_time_val, INT64_C(1000000), INT64_C(50000000));
+              ((int64_t)timestamp - (int64_t)prev_frame_real_end_ts_) / (int64_t)frames_elapsed;
+          frame_time_val = std::clamp(frame_time_val, INT64_C(0), INT64_C(50000000));
           if (phase == kUp) {
             inv_throughtput_.update(frame_time_val);
           }
@@ -240,6 +238,8 @@ public:
           TRACE_COUNTER("latencyflex", "Frame Time (Estimate)", inv_throughtput_.get());
         }
       }
+      prev_frame_real_end_ts_ = timestamp;
+      timestamp = std::max(timestamp, prev_frame_end_ts_ + target_frame_time);
       prev_frame_end_id_ = frame_id;
       prev_frame_end_ts_ = timestamp;
     }
