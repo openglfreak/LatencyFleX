@@ -44,17 +44,18 @@ public:
   // Returns: true if the sleep was fully performed or false if it was determined unnecessary
   //          because there are no inflight frames.
   bool SleepAndBegin(uint64_t frame, const std::chrono::nanoseconds &dur) {
+    std::this_thread::sleep_for(dur);
     std::unique_lock l(m);
-    bool skipped = cv.wait_for(l, dur, [this] { return last_began_frame == last_finished_frame; });
+    //bool skipped = cv.wait_for(l, dur, [this] { return last_began_frame == last_finished_frame; });
     last_began_frame = frame;
-    return !skipped;
+    return true;//!skipped;
   }
 
   void End(uint64_t frame) {
     std::unique_lock l(m);
     last_finished_frame = frame;
-    if (last_began_frame == last_finished_frame)
-      cv.notify_all();
+    /*if (last_began_frame == last_finished_frame)
+      cv.notify_all();*/
   }
 
 private:
