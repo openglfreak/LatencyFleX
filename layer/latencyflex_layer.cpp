@@ -36,36 +36,17 @@ namespace {
 std::atomic_uint64_t frame_counter = 0;
 std::atomic_bool ticker_needs_reset = false;
 std::atomic_uint64_t frame_counter_render = 0;
+std::atomic_uint64_t next_present_id = 0;
+std::atomic_uint64_t frame_end_ts = 0;
 
-lfx::LatencyFleX manager;
-
-class IdleTracker {
-public:
-  // Returns: true if the sleep was fully performed or false if it was determined unnecessary
-  //          because there are no inflight frames.
-  bool SleepAndBegin(uint64_t frame, const std::chrono::nanoseconds &dur) {
-    std::this_thread::sleep_for(dur);
-    std::unique_lock l(m);
-    //bool skipped = cv.wait_for(l, dur, [this] { return last_began_frame == last_finished_frame; });
-    last_began_frame = frame;
-    return true;//!skipped;
-  }
-
-  void End(uint64_t frame) {
-    std::unique_lock l(m);
-    last_finished_frame = frame;
-    /*if (last_began_frame == last_finished_frame)
-      cv.notify_all();*/
-  }
-
-private:
-  std::mutex m;
-  std::condition_variable cv;
-  std::uint64_t last_began_frame = UINT64_MAX;
-  std::uint64_t last_finished_frame = UINT64_MAX;
+struct SwapchainInfo {
+  VkDevice device;
+  uint64_t last_present_id_khr;
 };
 
-IdleTracker idle_tracker;
+std::map<VkSwapchainKHR, SwapchainInfo> swapchains;
+
+lfx::LatencyFleX manager;
 
 /* OPTIONS FROM ENVIRONMENT */
 
@@ -73,9 +54,6 @@ IdleTracker idle_tracker;
 // Useful for comparison benchmarks. Note that if the game does its own sleeping between the
 // syncpoint and input sampling, latency values from placebo mode might not be accurate.
 bool is_placebo_mode = false;
-
-// Max FPS override. The frame time target is stored inside the manager.
-bool max_fps_from_env = false;
 
 typedef void(VKAPI_PTR *PFN_overlay_SetMetrics)(const char **, const float *, size_t);
 PFN_overlay_SetMetrics overlay_SetMetrics = nullptr;
@@ -149,13 +127,13 @@ void FenceWaitThread::Worker() {
     dispatch.WaitForFences(device, 1, &info.fence, VK_TRUE, -1);
     uint64_t complete = current_time_ns();
     dispatch.DestroyFence(device, info.fence, nullptr);
+    frame_end_ts.store(complete);
 
     uint64_t latency;
     {
       scoped_lock l(global_lock);
       manager.EndFrame(info.frame_id, complete, &latency, nullptr);
     }
-    idle_tracker.End(info.frame_id);
     float latency_f = latency / 1000000.;
     const char *name = "Latency";
     if (overlay_SetMetrics && latency != UINT64_MAX) {
@@ -342,10 +320,9 @@ VkResult VKAPI_CALL lfx_EnumerateDeviceExtensionProperties(VkPhysicalDevice phys
 }
 
 VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
-  frame_counter_render++;
+  uint64_t frame_counter_render_local = ++frame_counter_render;
   uint64_t frame_counter_local = frame_counter.load();
-  uint64_t frame_counter_render_local = frame_counter_render.load();
-  if (frame_counter_local > frame_counter_render_local + kMaxFrameDrift) {
+  if (frame_counter_local > frame_counter_render_local) {
     ticker_needs_reset.store(true);
   }
 
@@ -367,6 +344,16 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
   submitInfo.pSignalSemaphores = pPresentInfo->pWaitSemaphores;
   dispatch.QueueSubmit(queue, 1, &submitInfo, fence);
   wait_threads[GetKey(device)]->Push({device, fence, frame_counter_render_local});
+  VkPresentTimeGOOGLE presentTime{};
+  presentTime.presentID = next_present_id++;
+  presentTime.desiredPresentTime = 0;
+  VkPresentInfoKHR presentInfoCopy = *pPresentInfo;
+  VkPresentTimesInfoGOOGLE presentTimes{};
+  presentTimes.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
+  presentTimes.pNext = presentInfoCopy.pNext;
+  presentTimes.swapchainCount = presentInfoCopy.swapchainCount;
+  presentTimes.pTimes = &presentTime;
+  presentInfoCopy.pNext = &presentTimes;
   l.unlock();
   return dispatch.QueuePresentKHR(queue, pPresentInfo);
 }
@@ -456,11 +443,34 @@ lfx_GetInstanceProcAddr(VkInstance instance, const char *pName) {
   }
 }
 
-extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
-  frame_counter++;
-  uint64_t frame_counter_local = frame_counter.load();
-  uint64_t frame_counter_render_local = frame_counter_render.load();
+static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin, uint64_t *refresh_duration) {
+  for (auto it = swapchains.begin(); it != swapchains.end(); ++it) {
+    VkSwapchainKHR swapchain = it->first;
+    VkDevice device = it->second.device;
+    uint64_t presentId = it->second.last_present_id_khr;
+    global_lock.unlock();
+    device_dispatch[GetKey(device)].WaitForPresentKHR(device, swapchain, presentId, -1);
+    global_lock.lock();
+    uint32_t count = 0;
+    device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, NULL);
+    if (count) {
+      std::vector<VkPastPresentationTimingGOOGLE> timings(count);
+      device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, &timings[0]);
+      for (auto it2 = timings.begin(); it2 != timings.end(); ++it2) {
+        *present_time = std::max(it2->actualPresentTime, *present_time);
+        *present_margin = std::max((it2->actualPresentTime - frame_end_ts.load()) - it2->presentMargin, *present_margin);
+      }
+    }
+    VkRefreshCycleDurationGOOGLE refresh_cycle;
+    device_dispatch[GetKey(device)].GetRefreshCycleDurationGOOGLE(device, swapchain, &refresh_cycle);
+    *refresh_duration = refresh_cycle.refreshDuration;
+  }
+}
 
+extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
+  uint64_t frame_counter_local = ++frame_counter;
+
+  uint64_t frame_counter_render_local = frame_counter_render.load();
   if (frame_counter_local <= frame_counter_render_local) {
     // Presentation has happened without going through the Tick() hook!
     // This typically happens during initialization (where graphics are redrawn
@@ -484,13 +494,37 @@ extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
     scoped_lock l(global_lock);
     manager.Reset();
   }
-  uint64_t now = current_time_ns();
-  uint64_t target;
-  uint64_t wakeup;
+
+  uint64_t present_time = 0;
+  uint64_t present_margin = 0;
+  uint64_t refresh_duration = 0;
   {
     scoped_lock l(global_lock);
-    target = manager.GetWaitTarget(frame_counter_local);
+    lfx_WaitForPresent(&present_time, &present_margin, &refresh_duration);
+    if (refresh_duration != 0) {
+      manager.min_refresh_period = refresh_duration;
+      manager.max_refresh_period = refresh_duration;
+    }
   }
+
+  uint64_t now;
+  if (!present_time)
+    present_time = (now = current_time_ns());
+  else {
+    // Translate from Vulkan timestamp to CLOCK_BOOTTIME
+    struct timespec tv;
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    present_time = (tv.tv_nsec + tv.tv_sec * UINT64_C(1000000000)) - present_time;
+    present_time += (now = current_time_ns());
+  }
+
+  uint64_t target;
+  {
+    scoped_lock l(global_lock);
+    target = manager.GetWaitTarget(frame_counter_local, present_time, present_margin);
+  }
+
+  uint64_t wakeup;
   if (!is_placebo_mode && target > now) {
     // failsafe: if something ever goes wrong, sustain an interactive framerate
     // so the user can at least quit the application
@@ -507,27 +541,21 @@ extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
       wakeup = target;
       failsafe_triggered = 0;
     }
-    if (!idle_tracker.SleepAndBegin(frame_counter_local, std::chrono::nanoseconds(wakeup - now)))
-      wakeup = current_time_ns();
+    std::this_thread::sleep_for(std::chrono::nanoseconds(wakeup - now));
+    wakeup = current_time_ns();
   } else {
-    idle_tracker.SleepAndBegin(frame_counter_local, std::chrono::nanoseconds::zero());
+    target = 0;
     wakeup = now;
   }
+
   {
     scoped_lock l(global_lock);
-    // Use the sleep target as the frame begin time. See `BeginFrame` docs.
     manager.BeginFrame(frame_counter_local, target, wakeup);
   }
 }
 
 extern "C" VK_LAYER_EXPORT void lfx_SetTargetFrameTime(uint64_t target_frame_time) {
-  scoped_lock l(global_lock);
-  if (max_fps_from_env) {
-    std::cerr << "LatencyFleX: Ignoring target_frame_time because LFX_MAX_FPS is set." << std::endl;
-    return;
-  }
-  manager.target_frame_time = target_frame_time;
-  std::cerr << "LatencyFleX: setting target frame time to " << manager.target_frame_time
+  std::cerr << "LatencyFleX: ignoring target frame of " << target_frame_time
             << std::endl;
 }
 
@@ -537,13 +565,6 @@ public:
   OnLoad() {
     std::cerr << "LatencyFleX: module loaded" << std::endl;
     std::cerr << "LatencyFleX: Version " LATENCYFLEX_VERSION << std::endl;
-    if (getenv("LFX_MAX_FPS")) {
-      // No lock needed because this is done inside static initialization.
-      manager.target_frame_time = 1000000000 / std::stoul(getenv("LFX_MAX_FPS"));
-      std::cerr << "LatencyFleX: setting target frame time to " << manager.target_frame_time
-                << " (from LFX_MAX_FPS)" << std::endl;
-      max_fps_from_env = true;
-    }
     if (getenv("LFX_PLACEBO")) {
       is_placebo_mode = true;
       std::cerr << "LatencyFleX: Running in placebo mode" << std::endl;

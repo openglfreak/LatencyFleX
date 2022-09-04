@@ -68,8 +68,6 @@ private:
 };
 } // namespace internal
 
-enum Phases { kUp = 0, kDown, kNumPhases };
-
 // Tracks and computes frame time, latency and the desired sleep time before
 // next tick. All time is in nanoseconds. The clock domain doesn't matter as
 // long as it's a single consistent clock.
@@ -77,208 +75,132 @@ enum Phases { kUp = 0, kDown, kNumPhases };
 // Access must be externally synchronized.
 class LatencyFleX {
 public:
-  LatencyFleX() : latency_(0.3), inv_throughtput_(0.3), proj_correction_(0.5, true) {
-    std::fill(std::begin(frame_begin_ids_), std::end(frame_begin_ids_), UINT64_MAX);
-  }
-
-  // Get the desired wake-up time. Sleep until this time, then call `BeginFrame()`. This function
-  // must be called *exactly once* before each call to `BeginFrame()`. Calling this the second time
-  // with the same `frame_id` will corrupt the internal time tracking.
-  //
-  // If a wait target cannot be determined due to lack of data, then `0` is
-  // returned.
-  uint64_t GetWaitTarget(uint64_t frame_id) {
-    if (prev_frame_end_id_ != UINT64_MAX) {
-      size_t phase = frame_id % kNumPhases;
-      double invtpt = std::max(inv_throughtput_.get(), (double)target_frame_time);
-      int64_t comp_to_apply = 0;
-      if (frame_end_projection_base_ == UINT64_MAX) {
-        frame_end_projection_base_ = prev_frame_end_ts_;
-      } else {
-        // The prediction error is equal to (actual latency) - (expected latency).
-        // As we adapt our latency estimator to the actual latency values, this
-        // will eventually converge as long as we are not constantly overpacing,
-        // building a queue at a faster pace than the estimator can adapt.
-
-        // In the section below, we attempt to apply additional compensation in
-        // the case of delay increase, to prevent extra queuing as much as possible.
-        int64_t prediction_error =
-            (int64_t)prev_frame_real_end_ts_ -
-            (int64_t)(frame_end_projection_base_ +
-                      frame_end_projected_ts_[prev_frame_end_id_ % kMaxInflightFrames]);
-        TRACE_COUNTER("latencyflex", "Prediction error", prediction_error);
-        int64_t prev_comp_applied = comp_applied_[prev_frame_end_id_ % kMaxInflightFrames];
-        // We need to limit the compensation to delay increase, or otherwise we would cancel out the
-        // regular delay decrease from our pacing. To achieve this, we treat any early prediction as
-        // having prediction error of zero.
-        //
-        // We also want to cancel out the counter-reaction from our previous compensation, so what
-        // we essentially want here is `prediction_error_ - prev_prediction_error_ +
-        // prev_comp_applied`. But since we clamp prediction_error_ and prev_prediction_error_,
-        // the naive approach of adding prev_comp_applied directly would have a bias toward
-        // overcompensation. Consider the example below where we're pacing at the correct (100%)
-        // rate but things arrives late due to reason that are *not* queuing (noise):
-        // 5ms late, 5ms late, ... (a period longer than our latency) ... , 0ms
-        // We would compensate -5ms on the first frame, bringing the prediction error to 0. But when
-        // the 0ms frame arrives, the prediction error becomes -5ms due to our overcompensation.
-        // Due to its negativity, we don't recompensate for this decrease: this is the bias.
-        //
-        // The solution here is to include prev_comp_applied as a part of clamping equation, which
-        // allows it to also undercompensate when it makes sense. It seems to do a great job on
-        // preventing prediction error from getting stuck in a state that is drift away.
-        proj_correction_.update(
-            std::max(INT64_C(0), prediction_error) -
-            std::max(INT64_C(0), prev_prediction_error_ - prev_comp_applied));
-        prev_prediction_error_ = prediction_error;
-        // Try to cancel out any unintended delay happened to previous frame start. This is
-        // primarily meant for cases where a frame time spike happens and we get backpressured
-        // on the main thread. prev_forced_correction_ will stay high until our prediction catches
-        // up, canceling out any excessive correction we might end up doing.
-        comp_to_apply = std::round(proj_correction_.get());
-        comp_applied_[frame_id % kMaxInflightFrames] = comp_to_apply;
-        TRACE_COUNTER("latencyflex", "Delay Compensation", comp_to_apply);
-      }
-
-      // The target wakeup time.
-      uint64_t target =
-          (int64_t)frame_end_projection_base_ +
-          (int64_t)frame_end_projected_ts_[prev_frame_begin_id_ % kMaxInflightFrames] +
-          comp_to_apply +
-          (int64_t)std::round((((int64_t)frame_id - (int64_t)prev_frame_begin_id_) +
-                               1 / (phase == kUp ? up_factor_ : 1) - 1) *
-                                  invtpt / down_factor_ -
-                              latency_.get());
-      // The projection is something close to the predicted frame end time, but it is always paced
-      // at down_factor * throughput, which prevents delay compensation from kicking in until it's
-      // actually necessary (i.e. we're overpacing).
-      uint64_t new_projection =
-          (int64_t)frame_end_projected_ts_[prev_frame_begin_id_ % kMaxInflightFrames] +
-          comp_to_apply +
-          (int64_t)std::round(((int64_t)frame_id - (int64_t)prev_frame_begin_id_) * invtpt /
-                              down_factor_);
-      frame_end_projected_ts_[frame_id % kMaxInflightFrames] = new_projection;
-      TRACE_EVENT_BEGIN(
-          "latencyflex", "projection",
-          perfetto::Track(track_base_ + frame_id % kMaxInflightFrames + kMaxInflightFrames),
-          target);
-      TRACE_EVENT_END(
-          "latencyflex",
-          perfetto::Track(track_base_ + frame_id % kMaxInflightFrames + kMaxInflightFrames),
-          frame_end_projection_base_ + new_projection);
-      return target;
-    } else {
+  uint64_t GetWaitTarget(uint64_t frame_id, uint64_t vblank_timestamp, uint64_t present_margin) {
+    //*earliest_present = 0;
+    if (prev_frame_end_id_ == UINT64_MAX)
+      return 0;
+    if (prev_frame_end_id_ != frame_id - 1) {
+      Reset();
       return 0;
     }
+
+    int64_t prediction_error = 0;
+    if (prev_frame_projected_end_ts_ != 0)
+      prediction_error = (int64_t)prev_frame_end_ts_ - (int64_t)prev_frame_projected_end_ts_;
+    proj_correction_.update(
+        std::max(INT64_C(0), prediction_error) -
+        std::max(INT64_C(0), prev_prediction_error_ - prev_comp_applied_));
+    prev_prediction_error_ = prediction_error;
+    int64_t comp_to_apply = std::round(proj_correction_.get());
+    prev_comp_applied_ = comp_to_apply;
+
+    uint64_t latency = (uint64_t)std::max(std::round(latency_.get()), 0.0);
+    uint64_t render_time = latency + present_margin + comp_to_apply;
+    uint64_t target = vblank_timestamp;
+    for (uint64_t lat = render_time;;) {
+      if (lat <= min_refresh_period)
+        target += min_refresh_period;
+      else if (lat <= max_refresh_period)
+        target += lat;
+      /*else if (earliest_present_supported) {
+        target += lat;
+        *earliest_present = target;
+      }*/
+      else {
+        target += max_refresh_period;
+        lat -= max_refresh_period;
+        continue;
+      }
+      break;
+    }
+    target -= render_time;
+    target -= wakeup_latency_.get();
+
+    prev_frame_projected_end_ts_ = target + latency;
+    return target != vblank_timestamp ? target : 0;
   }
 
-  // Begin the frame. Called on the main/simulation thread.
-  //
-  // This call must be preceded with a call to `GetWaitTarget()`.
-  //
-  // `target` should be the timestamp returned by `GetWaitTarget()`.
-  // `timestamp` should be calculated as follows:
-  // - If a sleep is not performed (because the wait target has already been
-  //   passed), then pass the current time.
-  // - If a sleep is performed (wait target was not in the past), then pass the
-  //   wait target as-is. This allows compensating for any latency incurred by
-  //   the OS for waking up the process.
+  // timestamp is the current time
+  // target is the wait target from GetWaitTarget, or 0 if no sleep was performed
   void BeginFrame(uint64_t frame_id, uint64_t target, uint64_t timestamp) {
     TRACE_EVENT_BEGIN("latencyflex", "frame",
-                      perfetto::Track(track_base_ + frame_id % kMaxInflightFrames), timestamp);
-    frame_begin_ids_[frame_id % kMaxInflightFrames] = frame_id;
-    frame_begin_ts_[frame_id % kMaxInflightFrames] = timestamp;
+                      perfetto::Track(track_base_), timestamp);
     prev_frame_begin_id_ = frame_id;
+    prev_frame_begin_ts_ = timestamp;
     if (target != 0) {
       int64_t forced_correction = timestamp - target;
-      frame_end_projected_ts_[frame_id % kMaxInflightFrames] += forced_correction;
-      comp_applied_[frame_id % kMaxInflightFrames] += forced_correction;
+      prev_frame_projected_end_ts_ += forced_correction;
+      prev_comp_applied_ += forced_correction;
       prev_prediction_error_ += forced_correction;
+      if (forced_correction >= 0)
+        wakeup_latency_.update(forced_correction);
     }
   }
 
-  // End the frame. Called from a rendering-related thread.
-  //
-  // The timestamp should be obtained in one of the following ways:
-  // - Run a thread dedicated to wait for command buffer completion fences.
-  //   Capture the timestamp on CPU when the fence is signaled.
-  // - Capture a GPU timestamp when frame ends, then convert it into a clock
-  //   domain on CPU (known as "timestamp calibration").
-  //
-  // If `latency` and `frame_time` are not null, then the latency and the frame
-  // time are returned respectively, or UINT64_MAX is returned if measurement is
-  // unavailable.
+  // timestamp is the current time
   void EndFrame(uint64_t frame_id, uint64_t timestamp, uint64_t *latency, uint64_t *frame_time) {
-    size_t phase = frame_id % kNumPhases;
     int64_t latency_val = -1;
     int64_t frame_time_val = -1;
-    if (frame_begin_ids_[frame_id % kMaxInflightFrames] == frame_id) {
-      frame_begin_ids_[frame_id % kMaxInflightFrames] = UINT64_MAX;
+    if (prev_frame_begin_id_ != UINT64_MAX && prev_frame_begin_id_ == frame_id) {
+      prev_frame_begin_id_ = UINT64_MAX;
 
       if (frame_time && prev_frame_end_id_ != UINT64_MAX)
-        *frame_time = timestamp - prev_frame_real_end_ts_;
-      auto frame_start = frame_begin_ts_[frame_id % kMaxInflightFrames];
+        *frame_time = timestamp - prev_frame_end_ts_;
+      auto frame_start = prev_frame_begin_ts_;
       latency_val = (int64_t)timestamp - (int64_t)frame_start;
-      if (latency_val < INT64_C(50000000) && phase == kDown) {
+      if (latency_val < INT64_C(50000000)) {
         latency_.update(latency_val);
       }
-      if (latency)
-        *latency = latency_val;
       TRACE_COUNTER("latencyflex", "Latency", latency_val);
       TRACE_COUNTER("latencyflex", "Latency (Estimate)", latency_.get());
-      if (prev_frame_end_id_ != UINT64_MAX) {
-        if (frame_id > prev_frame_end_id_) {
-          auto frames_elapsed = frame_id - prev_frame_end_id_;
-          frame_time_val =
-              ((int64_t)timestamp - (int64_t)prev_frame_real_end_ts_) / (int64_t)frames_elapsed;
-          if (frame_time_val < 0)
-            frame_time_val = 0;
-          if (frame_time_val < INT64_C(50000000) && phase == kUp) {
-            inv_throughtput_.update(frame_time_val);
-          }
-          TRACE_COUNTER("latencyflex", "Frame Time", frame_time_val);
-          TRACE_COUNTER("latencyflex", "Frame Time (Estimate)", inv_throughtput_.get());
+      if (prev_frame_end_id_ != UINT64_MAX && frame_id > prev_frame_end_id_) {
+        auto frames_elapsed = frame_id - prev_frame_end_id_;
+        frame_time_val =
+            ((int64_t)timestamp - (int64_t)prev_frame_end_ts_) / (int64_t)frames_elapsed;
+        if (frame_time_val < 0)
+          frame_time_val = 0;
+        if (frame_time_val < INT64_C(50000000)) {
+          inv_throughtput_.update(frame_time_val);
         }
+        TRACE_COUNTER("latencyflex", "Frame Time", frame_time_val);
+        TRACE_COUNTER("latencyflex", "Frame Time (Estimate)", inv_throughtput_.get());
       }
-      prev_frame_real_end_ts_ = timestamp;
-      timestamp = std::max(timestamp, prev_frame_end_ts_ + target_frame_time);
       prev_frame_end_id_ = frame_id;
       prev_frame_end_ts_ = timestamp;
     }
+    if (latency)
+      *latency = latency_val;
     if (frame_time)
       *frame_time = frame_time_val;
-    TRACE_EVENT_END("latencyflex", perfetto::Track(track_base_ + frame_id % kMaxInflightFrames),
+    TRACE_EVENT_END("latencyflex", perfetto::Track(track_base_),
                     timestamp);
   }
 
   void Reset() {
     auto new_instance = LatencyFleX();
 #ifdef LATENCYFLEX_HAVE_PERFETTO
-    new_instance.track_base_ = track_base_ + 2 * kMaxInflightFrames;
+    new_instance.track_base_ = track_base_ + 2;
 #endif
-    new_instance.target_frame_time = target_frame_time;
     *this = new_instance;
   }
 
-  uint64_t target_frame_time = 0;
+  uint64_t min_refresh_period = 0;
+  uint64_t max_refresh_period = 0;
 
 private:
-  static const std::size_t kMaxInflightFrames = 16;
-
-  uint64_t frame_begin_ts_[kMaxInflightFrames] = {};
-  uint64_t frame_begin_ids_[kMaxInflightFrames];
-  uint64_t frame_end_projected_ts_[kMaxInflightFrames] = {};
-  uint64_t frame_end_projection_base_ = UINT64_MAX;
-  int64_t comp_applied_[kMaxInflightFrames] = {};
   uint64_t prev_frame_begin_id_ = UINT64_MAX;
-  double up_factor_ = 1.05;
-  double down_factor_ = 0.995;
+  uint64_t prev_frame_begin_ts_ = 0;
+  uint64_t frame_end_projected_ts_ = 0;
+  int64_t prev_comp_applied_ = 0;
   int64_t prev_prediction_error_ = 0;
   uint64_t prev_frame_end_id_ = UINT64_MAX;
   uint64_t prev_frame_end_ts_ = 0;
-  uint64_t prev_frame_real_end_ts_ = 0;
-  internal::EwmaEstimator latency_;
-  internal::EwmaEstimator inv_throughtput_;
-  internal::EwmaEstimator proj_correction_;
+  uint64_t prev_frame_projected_end_ts_ = 0;
+
+  internal::EwmaEstimator latency_ = internal::EwmaEstimator(0.3);
+  internal::EwmaEstimator inv_throughtput_ = internal::EwmaEstimator(0.3);
+  internal::EwmaEstimator proj_correction_ = internal::EwmaEstimator(0.5, true);
+  internal::EwmaEstimator wakeup_latency_ = internal::EwmaEstimator(0.5, true);
 
 #ifdef LATENCYFLEX_HAVE_PERFETTO
   uint64_t track_base_ = 0;
