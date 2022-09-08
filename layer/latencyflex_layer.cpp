@@ -250,7 +250,7 @@ VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
   if (ret != VK_SUCCESS)
     return ret;
 
-#define ASSIGN_FUNCTION(name) dispatchTable.name = (PFN_vk##name)gdpa(*pDevice, "vk" #name);
+#define ASSIGN_FUNCTION(name) dispatchTable.name = (PFN_vk##name)gdpa(*pDevice, "vk" #name); std::cerr << #name ": " << (void*)dispatchTable.name << std::endl;
   // fetch our own dispatch table for the functions we need, into the next layer
   VkLayerDispatchTable dispatchTable;
   ASSIGN_FUNCTION(GetDeviceProcAddr);
