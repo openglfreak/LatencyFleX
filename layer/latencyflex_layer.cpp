@@ -36,12 +36,14 @@ namespace {
 std::atomic_uint64_t frame_counter = 0;
 std::atomic_bool ticker_needs_reset = false;
 std::atomic_uint64_t frame_counter_render = 0;
-std::atomic_uint64_t next_present_id = 0;
+std::atomic_uint64_t next_present_id_khr = 0;
+std::atomic_uint64_t next_present_id_google = 0;
 std::atomic_uint64_t frame_end_ts = 0;
 
 struct SwapchainInfo {
   VkDevice device;
-  uint64_t last_present_id_khr;
+  uint64_t present_id_khr;
+  uint64_t present_id_google;
 };
 
 std::map<VkSwapchainKHR, SwapchainInfo> swapchains;
@@ -202,6 +204,13 @@ void VKAPI_CALL lfx_DestroyInstance(VkInstance instance, const VkAllocationCallb
   instance_dispatch.erase(GetKey(instance));
 }
 
+static void lfx_AddStringToVectorSet(std::vector<const char*> &v, const char *s) {
+  for (auto iter = v.begin(); iter != v.end(); ++iter)
+    if (!std::strcmp(*iter, s))
+      return;
+  v.push_back(s);
+}
+
 VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
                                      const VkDeviceCreateInfo *pCreateInfo,
                                      const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) {
@@ -224,6 +233,17 @@ VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
   // move chain on for next layer
   layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
 
+  VkDeviceCreateInfo createInfo = *pCreateInfo;
+  std::vector<const char*> enabledExtensionNames(createInfo.ppEnabledExtensionNames,
+    createInfo.ppEnabledExtensionNames + createInfo.enabledExtensionCount);
+  lfx_AddStringToVectorSet(enabledExtensionNames, "VK_KHR_surface");
+  lfx_AddStringToVectorSet(enabledExtensionNames, "VK_KHR_swapchain");
+  lfx_AddStringToVectorSet(enabledExtensionNames, "VK_KHR_present_id");
+  lfx_AddStringToVectorSet(enabledExtensionNames, "VK_KHR_present_wait");
+  lfx_AddStringToVectorSet(enabledExtensionNames, "VK_GOOGLE_display_timing");
+  createInfo.enabledExtensionCount = enabledExtensionNames.size();
+  createInfo.ppEnabledExtensionNames = &enabledExtensionNames[0];
+
   PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice)gipa(VK_NULL_HANDLE, "vkCreateDevice");
 
   VkResult ret = createFunc(physicalDevice, pCreateInfo, pAllocator, pDevice);
@@ -242,6 +262,9 @@ VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
   ASSIGN_FUNCTION(DestroyFence);
   ASSIGN_FUNCTION(QueueSubmit);
   ASSIGN_FUNCTION(WaitForFences);
+  ASSIGN_FUNCTION(WaitForPresentKHR);
+  ASSIGN_FUNCTION(GetPastPresentationTimingGOOGLE);
+  ASSIGN_FUNCTION(GetRefreshCycleDurationGOOGLE);
 #undef ASSIGN_FUNCTION
 
   // store the table by key
@@ -319,6 +342,16 @@ VkResult VKAPI_CALL lfx_EnumerateDeviceExtensionProperties(VkPhysicalDevice phys
   return VK_SUCCESS;
 }
 
+template<typename T>
+static inline bool lfx_FindInPNextChain(const void *chain, VkStructureType type, T **out) {
+  for (const struct VkBaseInStructure *next = (const struct VkBaseInStructure *)chain; next; next = next->pNext)
+    if (next->sType == type) {
+      *out = (T*)next;
+      return true;
+    }
+  return false;
+}
+
 VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
   uint64_t frame_counter_render_local = ++frame_counter_render;
   uint64_t frame_counter_local = frame_counter.load();
@@ -344,16 +377,50 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
   submitInfo.pSignalSemaphores = pPresentInfo->pWaitSemaphores;
   dispatch.QueueSubmit(queue, 1, &submitInfo, fence);
   wait_threads[GetKey(device)]->Push({device, fence, frame_counter_render_local});
-  VkPresentTimeGOOGLE presentTime{};
-  presentTime.presentID = next_present_id++;
-  presentTime.desiredPresentTime = 0;
+
   VkPresentInfoKHR presentInfoCopy = *pPresentInfo;
+
+  VkPresentIdKHR presentId{};
+  std::vector<uint64_t> presentIds;
+  VkPresentIdKHR *pPresentId;
+  if (!lfx_FindInPNextChain(presentInfoCopy.pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR, &pPresentId)) {
+    presentId.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+    presentId.pNext = presentInfoCopy.pNext;
+    presentInfoCopy.pNext = &presentId;
+    presentId.swapchainCount = presentInfoCopy.swapchainCount;
+    uint64_t present_id_khr = next_present_id_khr++;
+    presentIds = std::vector<uint64_t>(presentId.swapchainCount);
+    for (uint32_t i = 0; i < presentId.swapchainCount; ++i)
+      presentIds[i] = present_id_khr;
+    presentId.pPresentIds = &presentIds[0];
+    pPresentId = &presentId;
+  }
+
   VkPresentTimesInfoGOOGLE presentTimes{};
-  presentTimes.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
-  presentTimes.pNext = presentInfoCopy.pNext;
-  presentTimes.swapchainCount = presentInfoCopy.swapchainCount;
-  presentTimes.pTimes = &presentTime;
-  presentInfoCopy.pNext = &presentTimes;
+  std::vector<VkPresentTimeGOOGLE> times;
+  VkPresentTimesInfoGOOGLE *pPresentTimes;
+  if (!lfx_FindInPNextChain(presentInfoCopy.pNext, VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, &pPresentTimes)) {
+    presentTimes.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
+    presentTimes.pNext = presentInfoCopy.pNext;
+    presentInfoCopy.pNext = &presentTimes;
+    presentTimes.swapchainCount = presentInfoCopy.swapchainCount;
+    uint64_t present_id_google = next_present_id_google++;
+    times = std::vector<VkPresentTimeGOOGLE>(presentTimes.swapchainCount);
+    for (uint32_t i = 0; i < presentTimes.swapchainCount; ++i) {
+      VkPresentTimeGOOGLE presentTime{};
+      presentTime.presentID = present_id_google;
+      presentTime.desiredPresentTime = 0;
+      times[i] = presentTime;
+    }
+    presentTimes.pTimes = &times[0];
+    pPresentTimes = &presentTimes;
+  }
+
+  for (uint32_t i = 0; i < presentInfoCopy.swapchainCount; ++i) {
+    VkSwapchainKHR swapchain = presentInfoCopy.pSwapchains[i];
+    swapchains[swapchain] = SwapchainInfo{device, pPresentId->pPresentIds[i], pPresentTimes->pTimes[i].presentID};
+  }
+
   l.unlock();
   return dispatch.QueuePresentKHR(queue, pPresentInfo);
 }
@@ -447,7 +514,7 @@ static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin,
   for (auto it = swapchains.begin(); it != swapchains.end(); ++it) {
     VkSwapchainKHR swapchain = it->first;
     VkDevice device = it->second.device;
-    uint64_t presentId = it->second.last_present_id_khr;
+    uint64_t presentId = it->second.present_id_khr;
     global_lock.unlock();
     device_dispatch[GetKey(device)].WaitForPresentKHR(device, swapchain, presentId, -1);
     global_lock.lock();
@@ -465,6 +532,7 @@ static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin,
     device_dispatch[GetKey(device)].GetRefreshCycleDurationGOOGLE(device, swapchain, &refresh_cycle);
     *refresh_duration = refresh_cycle.refreshDuration;
   }
+  swapchains.clear();
 }
 
 extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
