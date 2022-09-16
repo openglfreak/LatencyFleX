@@ -137,8 +137,8 @@ void FenceWaitThread::Worker() {
       for (auto it = swapchains.begin(); it != swapchains.end(); ++it) {
         VkSwapchainKHR swapchain = it->first;
         VkDevice device = it->second.device;
-        uint64_t presentId = it->second.present_id_khr;
-        /*global_lock.unlock();
+        /*uint64_t presentId = it->second.present_id_khr;
+        global_lock.unlock();
         device_dispatch[GetKey(device)].WaitForPresentKHR(device, swapchain, presentId, -1);
         global_lock.lock();*/
         uint32_t count = 0;
@@ -448,7 +448,7 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
   }
 
   l.unlock();
-  return dispatch.QueuePresentKHR(queue, pPresentInfo);
+  return dispatch.QueuePresentKHR(queue, &presentInfoCopy);
 }
 
 VkResult VKAPI_CALL lfx_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
