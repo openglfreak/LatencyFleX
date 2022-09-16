@@ -246,7 +246,7 @@ VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
 
   PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice)gipa(VK_NULL_HANDLE, "vkCreateDevice");
 
-  VkResult ret = createFunc(physicalDevice, pCreateInfo, pAllocator, pDevice);
+  VkResult ret = createFunc(physicalDevice, &createInfo, pAllocator, pDevice);
   if (ret != VK_SUCCESS)
     return ret;
 
