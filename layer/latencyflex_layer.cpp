@@ -36,8 +36,8 @@ namespace {
 std::atomic_uint64_t frame_counter = 0;
 std::atomic_bool ticker_needs_reset = false;
 std::atomic_uint64_t frame_counter_render = 0;
-std::atomic_uint64_t next_present_id_khr = 0;
-std::atomic_uint64_t next_present_id_google = 0;
+std::atomic_uint64_t next_present_id_khr = 1;
+std::atomic_uint64_t next_present_id_google = 1;
 std::atomic_uint64_t frame_end_ts = 0;
 
 struct SwapchainInfo {
@@ -130,6 +130,32 @@ void FenceWaitThread::Worker() {
     uint64_t complete = current_time_ns();
     dispatch.DestroyFence(device, info.fence, nullptr);
     frame_end_ts.store(complete);
+
+    {
+      scoped_lock l(global_lock);
+      uint64_t present_time = 0, present_margin = 0;
+      for (auto it = swapchains.begin(); it != swapchains.end(); ++it) {
+        VkSwapchainKHR swapchain = it->first;
+        VkDevice device = it->second.device;
+        uint64_t presentId = it->second.present_id_khr;
+        /*global_lock.unlock();
+        device_dispatch[GetKey(device)].WaitForPresentKHR(device, swapchain, presentId, -1);
+        global_lock.lock();*/
+        uint32_t count = 0;
+        device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, NULL);
+        if (count) {
+          std::vector<VkPastPresentationTimingGOOGLE> timings(count);
+          device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, &timings[0]);
+          for (auto it2 = timings.begin(); it2 != timings.end(); ++it2) {
+            present_time = std::max(it2->actualPresentTime, present_time);
+            present_margin = std::max((it2->actualPresentTime - frame_end_ts.load()) - it2->presentMargin, present_margin);
+          }
+        }
+      }
+      swapchains.clear();
+      if (present_time || present_margin)
+        std::cerr << "present_time: " << present_time << " present_margin: " << present_margin << std::endl;
+    }
 
     uint64_t latency;
     {
