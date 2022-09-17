@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#define DEBUG_OUTPUT 0
+
 #include "latencyflex_layer.h"
 #include "version.h"
 
@@ -22,6 +24,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -35,25 +38,39 @@
 #define LAYER_NAME "VK_LAYER_LFX_LatencyFleX"
 
 namespace {
-uint64_t frame_counter = 0;
-uint64_t frame_counter_render = 0;
 std::mutex frame_counter_lock;
 std::condition_variable frame_counter_condvar;
+uint64_t frame_counter_begin = 0;
+uint64_t frame_counter_end = 0;
+uint64_t frame_counter_queue = 0;
+
 std::atomic_bool ticker_needs_reset = false;
 
-uint64_t next_present_id_khr = 1;
 uint64_t next_present_id_google = 1;
 
-struct SwapchainInfo {
-  VkDevice device;
-  uint64_t present_id_khr;
+std::map<VkSwapchainKHR, VkDevice> swapchains;
+
+
+struct PresentIdToFrameIdMapping {
   uint64_t present_id_google;
+  uint64_t frame_id;
+
+  struct Compare {
+    bool operator()(struct PresentIdToFrameIdMapping const& first,
+                    struct PresentIdToFrameIdMapping const& second) const {
+      // Compare equal if present ids match
+      if (first.present_id_google == second.present_id_google)
+        return false;
+      // Must not compare equal with just frame id matching
+      if (first.frame_id == second.frame_id)
+        return first.present_id_google < second.present_id_google;
+      // Sort by frame id
+      return first.frame_id < second.frame_id;
+    }
+  };
 };
-
-std::multimap<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
-
-// Maps a VkPresentTimeGOOGLE id to a QueuePresentKHR timestamp
-std::map<uint64_t, uint64_t> queuePresentTimes;
+// Maps a present id to a frame id
+std::set<PresentIdToFrameIdMapping, PresentIdToFrameIdMapping::Compare> present_id_google_to_frame_id;
 
 lfx::LatencyFleX manager;
 
@@ -135,18 +152,30 @@ void FenceWaitThread::Worker() {
     dispatch.WaitForFences(device, 1, &info.fence, VK_TRUE, -1);
     uint64_t complete = current_time_ns();
     dispatch.DestroyFence(device, info.fence, nullptr);
-    continue;
 
+#if ADVANCED_MODE
     uint64_t latency;
     {
       scoped_lock l(global_lock);
       manager.EndFrame(info.frame_id, complete, &latency, nullptr);
     }
+
+    {
+      std::unique_lock<std::mutex> fl(frame_counter_lock);
+      uint64_t frame_counter_local = ++frame_counter_end;
+      frame_counter_condvar.notify_all();
+#if 0
+      if (frame_counter_begin > frame_counter_local)
+        ticker_needs_reset.store(true);
+#endif
+    }
+
     float latency_f = latency / 1000000.;
     const char *name = "Latency";
     if (overlay_SetMetrics && latency != UINT64_MAX) {
       overlay_SetMetrics(&name, &latency_f, 1);
     }
+#endif
   }
 }
 
@@ -256,7 +285,11 @@ VkResult VKAPI_CALL lfx_CreateDevice(VkPhysicalDevice physicalDevice,
   if (ret != VK_SUCCESS)
     return ret;
 
+#if DEBUG_OUTPUT
 #define ASSIGN_FUNCTION(name) dispatchTable.name = (PFN_vk##name)gdpa(*pDevice, "vk" #name); std::cerr << #name ": " << (void*)dispatchTable.name << std::endl;
+#else // DEBUG_OUTPUT
+#define ASSIGN_FUNCTION(name) dispatchTable.name = (PFN_vk##name)gdpa(*pDevice, "vk" #name);
+#endif // DEBUG_OUTPUT
   // fetch our own dispatch table for the functions we need, into the next layer
   VkLayerDispatchTable dispatchTable;
   ASSIGN_FUNCTION(GetDeviceProcAddr);
@@ -358,20 +391,29 @@ static inline bool lfx_FindInPNextChain(const void *chain, VkStructureType type,
   return false;
 }
 
-static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin, uint64_t *refresh_duration);
+static void lfx_ProjectPresentTime(uint64_t frame_id, uint64_t *projected_present_time);
+static inline uint64_t lfx_GetVulkanTime();
+
+extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame();
+bool wait_before_present;
+bool wait_after_present;
 
 VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
-  std::unique_lock<std::mutex> fl(frame_counter_lock); // needs to be held until the end of the function
-  uint64_t frame_counter_render_local = ++frame_counter_render;
-  frame_counter_condvar.notify_all();
-  if (frame_counter > frame_counter_render_local) {
-    ticker_needs_reset.store(true);
-  }
+  if (wait_before_present)
+    lfx_WaitAndBeginFrame();
 
   std::unique_lock<std::mutex> l(global_lock);
 
-  //uint64_t present_time, present_margin, refresh_duration;
-  //lfx_WaitForPresent(&present_time, &present_margin, &refresh_duration);
+  uint64_t frame_counter_local;
+  {
+    std::unique_lock<std::mutex> fl(frame_counter_lock);
+    frame_counter_local = ++frame_counter_queue;
+    frame_counter_condvar.notify_all();
+#if 0
+    if (frame_counter_begin > frame_counter_local)
+      ticker_needs_reset.store(true);
+#endif
+  }
 
   VkDevice device = device_map[GetKey(queue)];
   VkLayerDispatchTable &dispatch = device_dispatch[GetKey(queue)];
@@ -389,11 +431,11 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
   submitInfo.signalSemaphoreCount = pPresentInfo->waitSemaphoreCount;
   submitInfo.pSignalSemaphores = pPresentInfo->pWaitSemaphores;
   dispatch.QueueSubmit(queue, 1, &submitInfo, fence);
-  wait_threads[GetKey(device)]->Push({device, fence, frame_counter_render_local});
+  wait_threads[GetKey(device)]->Push({device, fence, frame_counter_local});
 
   VkPresentInfoKHR presentInfoCopy = *pPresentInfo;
 
-  VkPresentIdKHR presentId{};
+  /*VkPresentIdKHR presentId{};
   std::vector<uint64_t> presentIds;
   VkPresentIdKHR *pPresentId;
   if (!lfx_FindInPNextChain(presentInfoCopy.pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR, &pPresentId)) {
@@ -407,7 +449,14 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
       presentIds[i] = present_id_khr;
     presentId.pPresentIds = &presentIds[0];
     pPresentId = &presentId;
-  }
+  }*/
+
+  uint64_t projected_present_time;
+  lfx_ProjectPresentTime(frame_counter_local, &projected_present_time);
+  uint64_t desired_present_time = projected_present_time ? (projected_present_time - 200000) : 0;
+#if DEBUG_OUTPUT
+  std::cerr << "queueing frame_id " << frame_counter_local << " with desiredPresentTime " << desired_present_time << std::endl;
+#endif // DEBUG_OUTPUT
 
   VkPresentTimesInfoGOOGLE presentTimes{};
   std::vector<VkPresentTimeGOOGLE> times;
@@ -422,40 +471,71 @@ VkResult VKAPI_CALL lfx_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *p
     for (uint32_t i = 0; i < presentTimes.swapchainCount; ++i) {
       VkPresentTimeGOOGLE presentTime{};
       presentTime.presentID = present_id_google;
-      presentTime.desiredPresentTime = 0;
+      presentTime.desiredPresentTime = desired_present_time;
       times[i] = presentTime;
     }
     presentTimes.pTimes = &times[0];
     pPresentTimes = &presentTimes;
   }
 
-  swapchainInfos.clear();
-  for (uint32_t i = 0; i < presentInfoCopy.swapchainCount; ++i) {
-    VkSwapchainKHR swapchain = presentInfoCopy.pSwapchains[i];
-    swapchainInfos.insert(std::make_pair(swapchain, SwapchainInfo{device, pPresentId->pPresentIds[i], pPresentTimes->pTimes[i].presentID}));
+  swapchains.clear();
+  for (uint32_t i = 0; i < presentInfoCopy.swapchainCount; ++i)
+    swapchains[presentInfoCopy.pSwapchains[i]] = device;
+
+  if (present_id_google_to_frame_id.size() > 16) {
+    auto end = present_id_google_to_frame_id.begin();
+    std::advance(end, present_id_google_to_frame_id.size() - 16);
+    present_id_google_to_frame_id.erase(present_id_google_to_frame_id.begin(), end);
   }
 
-  while (queuePresentTimes.size() > 16) {
-    uint64_t lowest = UINT64_MAX;
-    for (auto it = queuePresentTimes.begin(); it != queuePresentTimes.end(); ++it)
-      if (it->first < lowest)
-        lowest = it->first;
-    queuePresentTimes.erase(queuePresentTimes.find(lowest));
-  }
+  for (uint32_t i = 0; i < pPresentTimes->swapchainCount; ++i)
+    present_id_google_to_frame_id.insert(PresentIdToFrameIdMapping{pPresentTimes->pTimes[i].presentID, frame_counter_local});
 
-  uint64_t current = current_time_ns();
-  for (uint32_t i = 0; i < presentInfoCopy.swapchainCount; ++i) {
-    uint64_t present_id_google = presentTimes.pTimes[i].presentID;
-    queuePresentTimes[present_id_google] = current;
+  l.unlock();
+  if (desired_present_time) {
+    struct timespec target;
+    target.tv_sec = desired_present_time / 1000000000;
+    target.tv_nsec = desired_present_time % 1000000000;
+    int err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
+    if (err)
+      std::cerr << "clock_nanosleep error " << err << std::endl;
   }
+  VkResult ret = dispatch.QueuePresentKHR(queue, &presentInfoCopy);
+#if DEBUG_OUTPUT
+  std::cerr << "queued frame_id " << frame_counter_local << " at time " << lfx_GetVulkanTime() << std::endl;
+#endif // DEBUG_OUTPUT
 
-  //l.unlock();
-  return dispatch.QueuePresentKHR(queue, &presentInfoCopy);
+  if (wait_after_present)
+    lfx_WaitAndBeginFrame();
+
+  return ret;
 }
+
+#if DEBUG_OUTPUT
+static uint64_t acquire_start_ts = 0;
+static uint64_t acquire_end_ts = 0;
+static inline void acquire_start()
+{
+  acquire_start_ts = current_time_ns();
+}
+static inline void acquire_end()
+{
+  uint64_t call_to_call = acquire_start_ts - acquire_end_ts;
+  acquire_end_ts = current_time_ns();
+  std::cerr
+    << "- acquire call-to-call: " << call_to_call
+    << "\n- acquire delay: " << (acquire_end_ts - acquire_start_ts)
+    << std::endl;
+}
+#else // DEBUG_OUTPUT
+static inline void acquire_start() {}
+static inline void acquire_end() {}
+#endif // DEBUG_OUTPUT
 
 VkResult VKAPI_CALL lfx_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                                             uint64_t timeout, VkSemaphore semaphore, VkFence fence,
                                             uint32_t *pImageIndex) {
+  acquire_start();
   std::unique_lock<std::mutex> l(global_lock);
   VkLayerDispatchTable &dispatch = device_dispatch[GetKey(device)];
   l.unlock();
@@ -468,12 +548,14 @@ VkResult VKAPI_CALL lfx_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swap
     // immediately.
     ticker_needs_reset.store(true);
   }
+  acquire_end();
   return res;
 }
 
 VkResult VKAPI_CALL lfx_AcquireNextImage2KHR(VkDevice device,
                                              const VkAcquireNextImageInfoKHR *pAcquireInfo,
                                              uint32_t *pImageIndex) {
+  acquire_start();
   std::unique_lock<std::mutex> l(global_lock);
   VkLayerDispatchTable &dispatch = device_dispatch[GetKey(device)];
   l.unlock();
@@ -485,6 +567,7 @@ VkResult VKAPI_CALL lfx_AcquireNextImage2KHR(VkDevice device,
     // immediately.
     ticker_needs_reset.store(true);
   }
+  acquire_end();
   return res;
 }
 
@@ -538,21 +621,17 @@ lfx_GetInstanceProcAddr(VkInstance instance, const char *pName) {
   }
 }
 
-static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin, uint64_t *refresh_duration) {
-  while (true) {
-    auto it = swapchainInfos.begin();
-    if (it == swapchainInfos.end())
-      break;
-    VkSwapchainKHR swapchain = it->first;
-    VkDevice device = it->second.device;
-    uint64_t presentId = it->second.present_id_khr;
+static struct PresentTimingInfo {
+  uint64_t last_present_frame_id;
+  uint64_t last_present_ts;
+} present_timing_info;
+static uint64_t vblank_interval = 16666667;
+static int64_t render_delay = 0;
 
-    global_lock.unlock();
-    VkResult res = device_dispatch[GetKey(device)].WaitForPresentKHR(device, swapchain, presentId, 20000000);
-    global_lock.lock();
-    if (res == VK_TIMEOUT)
-      break;
-    swapchainInfos.erase(it);
+static void lfx_UpdatePresentTimings() {
+  for (auto it = swapchains.begin(); it != swapchains.end(); ++it) {
+    VkSwapchainKHR swapchain = it->first;
+    VkDevice device = it->second;
 
     uint32_t count = 0;
     device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, NULL);
@@ -560,36 +639,71 @@ static void lfx_WaitForPresent(uint64_t *present_time, uint64_t *present_margin,
       std::vector<VkPastPresentationTimingGOOGLE> timings(count);
       device_dispatch[GetKey(device)].GetPastPresentationTimingGOOGLE(device, swapchain, &count, &timings[0]);
       for (auto it2 = timings.begin(); it2 != timings.end(); ++it2) {
-        auto it3 = queuePresentTimes.find(it2->presentID);
-        if (it3 == queuePresentTimes.end())
+        auto it3 = present_id_google_to_frame_id.begin();
+        for (; it3 != present_id_google_to_frame_id.end(); ++it3)
+          if (it3->present_id_google == it2->presentID)
+            break;
+        if (it3 == present_id_google_to_frame_id.end())
           continue;
-        uint64_t queuePresentTime = it3->second;
-        queuePresentTimes.erase(it3);
-        *present_time = std::max(it2->actualPresentTime, *present_time);
-        *present_margin = std::max((it2->actualPresentTime - queuePresentTime) - it2->presentMargin, *present_margin);
+        uint64_t frame_id = it3->frame_id;
+        present_id_google_to_frame_id.erase(present_id_google_to_frame_id.begin(), ++it3);
+#if DEBUG_OUTPUT
+        std::cerr << "actualPresentTime: " << it2->actualPresentTime << " frame id " << frame_id << std::endl;
+#endif // DEBUG_OUTPUT
+        // Warning: The current RADV GOOGLE_display_timing implementation is bugged,
+        // and sometimes returns the same actualPresentTime twice, even though it
+        // is not accurate. So discard any actualPresentTime that is too close to
+        // the saved last_present_ts.
+        if (frame_id > present_timing_info.last_present_frame_id && it2->actualPresentTime > present_timing_info.last_present_ts + vblank_interval - 200000) {
+          present_timing_info.last_present_frame_id = frame_id;
+          present_timing_info.last_present_ts = it2->actualPresentTime;
+        }
       }
     }
-
-    VkRefreshCycleDurationGOOGLE refresh_cycle;
-    device_dispatch[GetKey(device)].GetRefreshCycleDurationGOOGLE(device, swapchain, &refresh_cycle);
-    *refresh_duration = std::max(refresh_cycle.refreshDuration, *refresh_duration);
   }
+  swapchains.clear();
 }
 
+static void lfx_ProjectPresentTime(uint64_t frame_id, uint64_t *projected_present_time) {
+  if (!present_timing_info.last_present_frame_id) {
+    *projected_present_time = 0;
+    return;
+  }
+  uint64_t frame_count = frame_id - present_timing_info.last_present_frame_id;
+#if DEBUG_OUTPUT
+  std::cerr << "lfx_ProjectPresentTime frame_count: " << frame_count << std::endl;
+#endif // DEBUG_OUTPUT
+  *projected_present_time = present_timing_info.last_present_ts + vblank_interval * frame_count;
+}
+
+static inline uint64_t lfx_GetVulkanTime() {
+    struct timespec tv;
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return tv.tv_nsec + tv.tv_sec * UINT64_C(1000000000);
+}
+
+static uint64_t last_call;
 extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
+  uint64_t start = current_time_ns(), wait_end = 0;
+
   uint64_t frame_counter_local;
   {
     std::unique_lock<std::mutex> fl(frame_counter_lock);
-    while (frame_counter > frame_counter_render && !ticker_needs_reset.load()) {
+#if 0
+    while (frame_counter_begin > frame_counter_end && !ticker_needs_reset.load())
       frame_counter_condvar.wait(fl);
-    }
-    frame_counter_local = ++frame_counter;
-    if (frame_counter_local <= frame_counter_render) {
+#endif
+    wait_end = current_time_ns();
+    frame_counter_local = ++frame_counter_begin;
+    frame_counter_condvar.notify_all();
+#if 1
+    if (frame_counter_local <= frame_counter_end) {
       // Presentation has happened without going through the Tick() hook!
       // This typically happens during initialization (where graphics are redrawn
       // without ticking the platform loop).
       ticker_needs_reset.store(true);
     }
+#endif
   }
 
   if (ticker_needs_reset.load()) {
@@ -602,48 +716,52 @@ extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
     // from 1, or otherwise it will result in frame ID mismatch.
     {
       std::unique_lock<std::mutex> fl(frame_counter_lock);
-      frame_counter = 1;
+      frame_counter_begin = 1;
       frame_counter_local = 1;
-      frame_counter_render = 0;
+      frame_counter_end = 0;
+      frame_counter_queue = 0;
     }
     ticker_needs_reset.store(false);
     scoped_lock l(global_lock);
-    swapchainInfos.clear();
-    queuePresentTimes.clear();
+    swapchains.clear();
+    present_id_google_to_frame_id.clear();
+    present_timing_info = PresentTimingInfo();
     manager.Reset();
   }
 
-  uint64_t present_time = 0;
-  uint64_t present_margin = 0;
-  uint64_t refresh_duration = 0;
+  uint64_t projected_present_time;
   {
     scoped_lock l(global_lock);
-    //std::cerr << "wait start" << std::endl;
-    lfx_WaitForPresent(&present_time, &present_margin, &refresh_duration);
-    //std::cerr << "wait end: present_time=" << present_time << ", present_margin=" << present_margin << ", refresh_duration=" << refresh_duration << std::endl;
-    if (refresh_duration != 0) {
-      manager.min_refresh_period = refresh_duration;
-      manager.max_refresh_period = refresh_duration;
-    }
+    manager.min_refresh_period = vblank_interval;
+    manager.max_refresh_period = vblank_interval;
+    lfx_UpdatePresentTimings();
+    lfx_ProjectPresentTime(frame_counter_local, &projected_present_time);
   }
-  return;
 
   uint64_t now;
-  if (!present_time)
-    present_time = (now = current_time_ns());
+  if (!projected_present_time)
+    projected_present_time = (now = current_time_ns());
   else {
     // Translate from Vulkan timestamp to CLOCK_BOOTTIME
-    struct timespec tv;
-    clock_gettime(CLOCK_MONOTONIC, &tv);
-    present_time = (tv.tv_nsec + tv.tv_sec * UINT64_C(1000000000)) - present_time;
-    present_time += (now = current_time_ns());
+    projected_present_time = projected_present_time - lfx_GetVulkanTime();
+    projected_present_time += (now = current_time_ns());
   }
 
+#if !ADVANCED_MODE
+  if (!is_placebo_mode) {
+    uint64_t target = projected_present_time - vblank_interval + render_delay;
+    if (target > now)
+      std::this_thread::sleep_for(std::chrono::nanoseconds(target - now));
+  }
+#else
   uint64_t target;
   {
     scoped_lock l(global_lock);
-    target = manager.GetWaitTarget(frame_counter_local, present_time, present_margin);
+    target = manager.GetWaitTarget(frame_counter_local, now, projected_present_time - vblank_interval, 200000);
   }
+#if DEBUG_OUTPUT
+  std::cerr << "sleep time: " << (target != 0 ? (int64_t)(target - now) : INT64_C(0)) << std::endl;
+#endif // DEBUG_OUTPUT
 
   uint64_t wakeup;
   if (!is_placebo_mode && target > now) {
@@ -668,14 +786,25 @@ extern "C" VK_LAYER_EXPORT void lfx_WaitAndBeginFrame() {
     target = 0;
     wakeup = now;
   }
-  static int i;
-  if (target > now && i++ < 100)
-    std::cerr << "sleep time: " << (target - now) << std::endl;
 
   {
     scoped_lock l(global_lock);
     manager.BeginFrame(frame_counter_local, target, wakeup);
   }
+#endif
+
+  uint64_t end = current_time_ns();
+#if DEBUG_OUTPUT
+  std::cerr
+    << "+ call-to-call delay: " << (start - last_call)
+    << "\n+ actual delay = " << (end - start)
+    << "\n+ wait_end - last_call = " << (wait_end - last_call)
+    << "\n+ wait_end - start = " << (wait_end - start)
+    << "\n+ now = " << now
+    << "\n+ frame_id = " << frame_counter_local
+    << std::endl;
+#endif // DEBUG_OUTPUT
+  last_call = end;
 }
 
 extern "C" VK_LAYER_EXPORT void lfx_SetTargetFrameTime(uint64_t target_frame_time) {
@@ -687,12 +816,39 @@ namespace {
 class OnLoad {
 public:
   OnLoad() {
+    std::streamsize orig_precision = std::cerr.precision();
+    std::ios_base::fmtflags orig_flags = std::cerr.flags();
+    std::cerr.precision(2);
+    std::cerr.setf(std::ios::fixed, std::ios::floatfield);
+    std::cerr.setf(std::ios::showpoint);
     std::cerr << "LatencyFleX: module loaded" << std::endl;
     std::cerr << "LatencyFleX: Version " LATENCYFLEX_VERSION << std::endl;
     if (getenv("LFX_PLACEBO")) {
       is_placebo_mode = true;
       std::cerr << "LatencyFleX: Running in placebo mode" << std::endl;
     }
+    if (getenv("LFX_VBLANK_INTERVAL")) {
+      vblank_interval = std::stoul(getenv("LFX_VBLANK_INTERVAL"));
+    }
+    double framerate = 1000000000.0 / vblank_interval;
+    std::cerr << "LatencyFleX: Assuming vertical blanking interval of " << vblank_interval << " ns" << std::endl;
+    if (getenv("LFX_RENDER_DELAY")) {
+      render_delay = std::stol(getenv("LFX_RENDER_DELAY"));
+      double min_framerate = 1000000000.0 / (vblank_interval - render_delay);
+      std::cerr << "LatencyFleX: Delaying rendering by " << render_delay << " ns (minimum frame rate: " << min_framerate << " fps)" << std::endl;
+    }
+    if (getenv("LFX_WAIT_BEFORE_PRESENT"))
+      wait_before_present = true;
+    if (getenv("LFX_WAIT_AFTER_PRESENT")) {
+      wait_before_present = false;
+      wait_after_present = true;
+    }
+    if (wait_before_present)
+      std::cerr << "LatencyFleX: Waiting before vkQueuePresentKHR" << std::endl;
+    if (wait_after_present)
+      std::cerr << "LatencyFleX: Waiting after vkQueuePresentKHR" << std::endl;
+    std::cerr.precision(orig_precision);
+    std::cerr.flags(orig_flags);
   }
 };
 

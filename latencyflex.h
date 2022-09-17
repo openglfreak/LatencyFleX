@@ -75,14 +75,10 @@ private:
 // Access must be externally synchronized.
 class LatencyFleX {
 public:
-  uint64_t GetWaitTarget(uint64_t frame_id, uint64_t vblank_timestamp, uint64_t present_margin) {
+  uint64_t GetWaitTarget(uint64_t frame_id, uint64_t now, uint64_t vblank_timestamp, uint64_t present_margin) {
     //*earliest_present = 0;
     if (prev_frame_end_id_ == UINT64_MAX)
       return 0;
-    if (prev_frame_end_id_ != frame_id - 1) {
-      Reset();
-      return 0;
-    }
 
     int64_t prediction_error = 0;
     if (prev_frame_projected_end_ts_ != 0)
@@ -95,7 +91,7 @@ public:
     prev_comp_applied_ = comp_to_apply;
 
     uint64_t latency = (uint64_t)std::max(std::round(latency_.get()), 0.0);
-    uint64_t render_time = latency + present_margin + comp_to_apply;
+    uint64_t render_time = latency + present_margin + comp_to_apply + wakeup_latency_.get();
     uint64_t target = vblank_timestamp;
     for (uint64_t lat = render_time;;) {
       if (lat <= min_refresh_period)
@@ -111,13 +107,25 @@ public:
         lat -= max_refresh_period;
         continue;
       }
+      while (target < now)
+        target += max_refresh_period;
       break;
     }
     target -= render_time;
-    target -= wakeup_latency_.get();
+    std::cerr
+      << "latency: " << latency
+      << "\npresent_margin: " << present_margin
+      << "\ncomp_to_apply: " << comp_to_apply
+      << "\nwakeup_latency_.get(): " << wakeup_latency_.get()
+      << "\ntarget - now: " << (target - now)
+      << "\nnow: " << now
+      << "\nvblank_timestamp: " << vblank_timestamp
+      << std::endl;
 
-    prev_frame_projected_end_ts_ = target + latency;
-    return target != vblank_timestamp ? target : 0;
+    if (target < now)
+      target = now;
+    prev_frame_projected_end_ts_ = target + latency + wakeup_latency_.get();
+    return target > now ? target : 0;
   }
 
   // timestamp is the current time
